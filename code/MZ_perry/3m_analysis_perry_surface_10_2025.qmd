@@ -1,0 +1,922 @@
+---
+title: "3m_analysis_perry_surface_10_2025"
+format: html
+---
+
+```{r}
+# Load libraries
+library(terra)
+library(tidyverse)
+library(sf)
+library(corrplot)
+library(janitor)
+library(pheatmap)
+library(randomForest)
+library(caret)     
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(doParallel)
+library(vip)
+library(blockCV)
+library(glmnet)
+library(nnls)
+```
+
+```{r}
+#covariate stack at 3m:
+covariate_stack <- rast("C:/git/remote/data/Covariate/covariate_stack_3m.tif")
+
+#covariate extracted data at soil points csv at 3m:
+soil_covariate_data_scaled_SP <- read.csv("C:/git/remote/data/Soil data/Surface/Perry_soil_covariate_data_scaled_SP.csv")
+
+soil_covariate_data_scaled_C <- read.csv("C:/git/remote/data/Soil data/Surface/Perry_soil_covariate_data_scaled_C.csv")
+
+soil_vars <- c("lbc_1", "lb_ceq", "p_h_2", "ca", "k", "mg", "mn", "p", "zn")
+  # Covariate columns: all others, except IDs, coordinates, labels, and soil_vars
+covariate_vars <- setdiff(names(soil_covariate_data_scaled_SP),
+    c(soil_vars, "ID", "Label", "Row", "RowNUM", "type", "PointLabel", "Plbsac"))
+  
+  soil_data_SP <- soil_covariate_data_scaled_SP [, soil_vars]
+  soil_data_C <- soil_covariate_data_scaled_C [, soil_vars]
+  covariate_data <- soil_covariate_data_scaled_SP [, covariate_vars]
+  covariate_data[] <- lapply(covariate_data, function(x) as.numeric(as.character(x))) # Make sure predictors are numeric and no NA's sneak in
+```
+
+
+```{r}
+library(sf)
+library(blockCV)
+
+# settings
+n_folds <- 5
+
+# 1) build SF from your data (assumes soil_covariate_data_scaled_C has columns x,y)
+pts_raw <- soil_covariate_data_scaled_C
+stopifnot(all(c("x","y") %in% names(pts_raw)))
+
+# If coords are lon/lat (degrees) use crs=4326; if they are already projected (meters),
+# set crs to the appropriate EPSG (replace NA with your EPSG like 27700 or 32633).
+# Here we try to auto-detect: if coords range within -180..180 and -90..90 assume lon/lat
+xr <- range(pts_raw$x, na.rm = TRUE)
+yr <- range(pts_raw$y, na.rm = TRUE)
+if (xr[1] >= -180 && xr[2] <= 180 && yr[1] >= -90 && yr[2] <= 90) {
+  message("Coordinates look like lon/lat -> creating sf with crs = 4326 and reprojecting to UTM")
+  pts_sf <- st_as_sf(pts_raw, coords = c("x","y"), crs = 4326)
+  # compute UTM zone from mean lon/lat
+  mean_lon <- mean(st_coordinates(pts_sf)[,1])
+  mean_lat <- mean(st_coordinates(pts_sf)[,2])
+  utm_zone <- floor((mean_lon + 180) / 6) + 1
+  epsg <- if (mean_lat >= 0) 32600 + utm_zone else 32700 + utm_zone
+  pts_proj <- st_transform(pts_sf, crs = epsg)
+} else {
+  message("Coordinates do not look like lon/lat. Assuming they are already projected (meters). Set CRS explicitly if needed.")
+  # if you know the EPSG, replace NA below with e.g. 326xx
+  pts_sf <- st_as_sf(pts_raw, coords = c("x","y"), crs = NA)
+  # If you know the EPSG, set it:
+  # pts_sf <- st_as_sf(pts_raw, coords = c("x","y"), crs = 326XX)
+  pts_proj <- pts_sf
+}
+
+# 2) compute an automatic block size (meters) based on extent and n_folds
+bb <- st_bbox(pts_proj)
+xrange <- bb$xmax - bb$xmin
+yrange <- bb$ymax - bb$ymin
+area <- xrange * yrange
+# heuristic: square block side to give ~n_folds blocks across area
+block_side <- sqrt(area / n_folds)
+message(sprintf("Automatic block side (meters): %.1f", block_side))
+
+# alternative heuristics:
+# - choose block_side <- max(xrange, yrange) / sqrt(n_folds) 
+# - choose block_side <- quantile(dist(pairwise), 0.25)  (if you want distance-based)
+
+# 3) run spatialBlock using theRange = block_side
+set.seed(123)
+sb <- spatialBlock(speciesData = pts_proj,
+                   theRange = block_side,   # in meters
+                   k = n_folds,
+                   selection = "systematic",
+                   iteration = 100,
+                   showBlocks = TRUE)       # set FALSE in scripts
+
+# extract fold ids for caret
+fold_ids <- sb$foldID
+table(fold_ids)
+# Build caret index lists for spatial CV: index is a list of training indices for each fold
+index <- list()
+indexOut <- list()  # optional: hold-out indices
+for (k in seq_len(n_folds)) {
+  test_idx <- which(fold_ids == k)
+  train_idx <- setdiff(seq_len(nrow(soil_covariate_data_scaled_C)), test_idx)
+  index[[paste0("Fold", k)]] <- train_idx
+  indexOut[[paste0("Fold", k)]] <- test_idx
+}
+
+# TrainControl to pass to caret::rfe (so rfe uses spatial folds)
+tr_ctrl <- trainControl(method = "cv",
+                        number = n_folds,
+                        index = index,
+                        indexOut = indexOut,
+                        savePredictions = "final",
+                        verboseIter = FALSE)
+
+# RFE settings (use caret's rfFuncs)
+rfe_ctrl <- rfeControl(functions = rfFuncs,
+                       method = "cv",
+                       number = n_folds,
+                       verbose = TRUE,
+                       returnResamp = "all")
+
+# We'll store results per nutrient here
+rfe_results_C <- list()
+selected_vars_C <- list()
+
+# Run RFE for each nutrient using soil_data_C
+for (tgt in soil_vars) {
+  message("=== RFE (spatial CV) for ", tgt, " ===")
+  # Build data frame: response + covariates (use covariate_data from SP or create from C as needed)
+  df_all <- soil_covariate_data_scaled_C[, c(tgt, covariate_vars, "x", "y"), drop = FALSE]
+  df_all <- na.omit(df_all)  # remove rows with NA
+  if (nrow(df_all) < 20) {
+    warning("Too few rows for ", tgt, "; skipping RFE.")
+    next
+  }
+
+  # predictors only (ensure numeric)
+  pred_df <- df_all[, covariate_vars, drop = FALSE]
+  pred_df[] <- lapply(pred_df, function(x) as.numeric(as.character(x)))
+  response <- df_all[[tgt]]
+
+  # sizes to try (1 to all)
+  sizes <- seq(1, min(ncol(pred_df), 25))  # limit to 25 to speed up; adjust if desired
+
+  set.seed(123)
+  # Using rfe: pass trControl via 'trainControl' argument using 'trControl' in caret::train behaviour
+  rfe_fit <- rfe(x = pred_df,
+                 y = response,
+                 sizes = sizes,
+                 rfeControl = rfe_ctrl,
+                 # pass train control for the underlying train() calls to use spatial CV
+                 trControl = tr_ctrl,
+                 metric = "RMSE",
+                 ntree = ntree_rf)
+
+  rfe_results_C[[tgt]] <- rfe_fit
+  opt <- predictors(rfe_fit)
+  selected_vars_C[[tgt]] <- opt
+  message("Selected (", length(opt), "): ", paste(opt, collapse = ", "))
+
+  # Save rie object
+  saveRDS(rfe_fit, file = file.path(out_dir, paste0("rfe_fit_", tgt, "_C.rds")))
+}
+
+# Save selected variables summary
+sel_df <- tibble::tibble(
+  target = names(selected_vars_C),
+  selected = sapply(selected_vars_C, function(x) paste(x, collapse = ";")),
+  n_selected = sapply(selected_vars_C, length)
+)
+write.csv(sel_df, file.path(out_dir, "rfe_selected_summary_C.csv"), row.names = FALSE)
+message("Saved RFE summary to ", file.path(out_dir, "rfe_selected_summary_C.csv"))
+
+# ---- Evaluate spatial CV performance for selected-variable model (single-model baseline) ----
+# For each nutrient, train caret::train with the selected vars and spatial CV (tr_ctrl)
+spatial_cv_perf <- list()
+for (tgt in names(selected_vars_C)) {
+  opt_vars <- selected_vars_C[[tgt]]
+  if (length(opt_vars) == 0) next
+  df_all <- soil_covariate_data_scaled_C[, c(tgt, opt_vars, "x","y"), drop = FALSE] %>% na.omit()
+  if (nrow(df_all) < n_folds) next
+
+  set.seed(123)
+  train_df <- df_all[, c(opt_vars)]
+  y <- df_all[[tgt]]
+
+  # caret::train with randomForest method uses the same parameters; this gives spatial CV RMSE/R2
+  tc <- trainControl(method = "cv", index = index, savePredictions = "final")
+  rf_tr <- train(x = train_df, y = y,
+                 method = "rf",
+                 metric = "RMSE",
+                 ntree = ntree_rf,
+                 trControl = tc,
+                 importance = TRUE)
+
+  spatial_cv_perf[[tgt]] <- rf_tr$results
+  saveRDS(rf_tr, file = file.path(out_dir, paste0("rf_spatialcv_", tgt, "_C.rds")))
+  message("Spatial CV (", tgt, "):")
+  print(rf_tr$results)
+}
+
+# ---- Bootstrap ensemble training (save models to disk) ----
+# We'll save each bootstrap model to disk and record OOB R2 (fast)
+models_dir <- file.path(out_dir, "bootstrap_models")
+dir.create(models_dir, recursive = TRUE, showWarnings = FALSE)
+
+bootstrap_meta <- list()
+
+set.seed(2023)
+seeds <- sample.int(1e7, n_boot)
+
+for (tgt in names(selected_vars_C)) {
+  message("=== Bootstrapping ensemble for ", tgt, " ===")
+  opt_vars <- selected_vars_C[[tgt]]
+  if (length(opt_vars) == 0) {
+    warning("No selected vars for ", tgt, "; skipping bootstrap.")
+    next
+  }
+
+  df_all <- soil_covariate_data_scaled_C[, c(tgt, opt_vars), drop = FALSE] %>% na.omit()
+  nrow(df_all) -> n_rows
+  if (n_rows < 10) { warning("Too few samples for ", tgt); next }
+
+  model_files <- character(n_boot)
+  oob_r2 <- numeric(n_boot)
+  oob_rmse <- numeric(n_boot)
+
+  for (i in seq_len(n_boot)) {
+    set.seed(seeds[i])
+    # bootstrap sample with replacement for training
+    samp_idx <- sample(seq_len(nrow(df_all)), size = nrow(df_all), replace = TRUE)
+    train_df <- df_all[samp_idx, , drop = FALSE]
+
+    rf_model <- randomForest(x = train_df[, opt_vars, drop = FALSE],
+                             y = train_df[[tgt]],
+                             ntree = ntree_rf,
+                             importance = FALSE)
+
+    # compute OOB metrics (from randomForest object)
+    # OOB RMSE from final tree: sqrt(last mse)
+    oob_rmse[i] <- sqrt(tail(rf_model$mse, n = 1))
+    oob_r2[i] <- tail(rf_model$rsq, n = 1)  # OOB pseudo-R2 (may be negative)
+    fname <- file.path(models_dir, sprintf("%s_boot_%04d.rds", tgt, i))
+    saveRDS(rf_model, file = fname, compress = TRUE)
+    model_files[i] <- fname
+
+    if (i %% 50 == 0) message("  completed ", i, " / ", n_boot)
+  }
+
+  bootstrap_meta[[tgt]] <- list(model_files = model_files,
+                                oob_r2 = oob_r2,
+                                oob_rmse = oob_rmse,
+                                opt_vars = opt_vars,
+                                n_train = nrow(df_all))
+  # save intermediate metadata for robustness
+  saveRDS(bootstrap_meta, file = file.path(out_dir, "bootstrap_meta_C.rds"))
+}
+
+# ---- Ensemble mapping: load bootstrap models, predict rasters, produce weighted mean / sd / quantiles ----
+cov_stack <- covariate_stack  # from your original code
+for (tgt in names(bootstrap_meta)) {
+  meta <- bootstrap_meta[[tgt]]
+  opt_vars <- meta$opt_vars
+  # check raster layers
+  if (!all(opt_vars %in% names(cov_stack))) {
+    stop("Raster layer names do not match selected predictors for ", tgt, ". Rename raster layers or change opt_vars.")
+  }
+  pred_stack_template <- cov_stack[[opt_vars]]
+
+  # choose which model files to use: filter valid models (non-NA file & non-NA OOB)
+  valid_idx <- which(file.exists(meta$model_files) & !is.na(meta$oob_r2))
+  if (length(valid_idx) == 0) { warning("No valid bootstrap models for ", tgt); next }
+
+  files <- meta$model_files[valid_idx]
+  oob_r2s <- meta$oob_r2[valid_idx]
+
+  # Optionally keep top_k by OOB R2 to speed prediction
+  top_k <- 200
+  keep_n <- min(length(files), top_k)
+  ord <- order(oob_r2s, decreasing = TRUE)
+  keep_idx <- ord[seq_len(keep_n)]
+  files_keep <- files[keep_idx]
+  weights_raw <- oob_r2s[keep_idx]
+  # convert negative R2 to 0
+  weights_raw[weights_raw < 0] <- 0
+  if (sum(weights_raw) == 0) weights <- rep(1/length(weights_raw), length(weights_raw)) else weights <- weights_raw / sum(weights_raw)
+
+  # For each selected model, predict raster and save layer (streams to disk)
+  pred_files <- character(length(files_keep))
+  for (j in seq_along(files_keep)) {
+    model_j <- readRDS(files_keep[j])
+    out_fname <- file.path(out_dir, sprintf("%s_pred_model%03d.tif", tgt, j))
+    # terra::predict can accept randomForest objects
+    predict(pred_stack_template, model_j, filename = out_fname, overwrite = TRUE, progress = TRUE)
+    pred_files[j] <- out_fname
+  }
+
+  # stack predictions and compute ensemble maps
+  pred_stack <- rast(pred_files)
+  # weighted mean
+  mean_fname <- file.path(out_dir, sprintf("%s_weighted_mean.tif", tgt))
+  mean_map <- app(pred_stack, fun = function(v, w) sum(v * w, na.rm = TRUE), w = weights, filename = mean_fname, overwrite = TRUE)
+  # weighted E[X^2]
+  mean_sq_fname <- file.path(out_dir, sprintf("%s_weighted_mean_sq.tif", tgt))
+  mean_sq <- app(pred_stack, fun = function(v, w) sum(w * (v^2), na.rm = TRUE), w = weights, filename = mean_sq_fname, overwrite = TRUE)
+  # sd = sqrt(E[X^2] - (E[X])^2)
+  sd_map <- sqrt(mean_sq - mean_map^2)
+  writeRaster(sd_map, file.path(out_dir, sprintf("%s_weighted_sd.tif", tgt)), overwrite = TRUE)
+
+  # quantiles (2.5% and 97.5%)
+  quant_fname <- file.path(out_dir, sprintf("%s_quantiles.tif", tgt))
+  q_map <- app(pred_stack, fun = function(v) {
+    if (all(is.na(v))) return(c(NA, NA))
+    quantile(v, probs = c(0.025, 0.975), na.rm = TRUE)
+  }, filename = quant_fname, overwrite = TRUE)
+  names(q_map) <- c("q2.5", "q97.5")
+
+  message("Saved ensemble maps for ", tgt, " to ", out_dir)
+} # end nutrient loop
+
+# ---- Summary: write bootstrap metadata and RFE results ----
+saveRDS(bootstrap_meta, file = file.path(out_dir, "bootstrap_meta_C_final.rds"))
+saveRDS(rfe_results_C, file = file.path(out_dir, "rfe_results_C_final.rds"))
+message("Finished. Outputs are in: ", out_dir)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#Single Point RFE + RF + VIP analysis
+# --- RFE settings ---
+set.seed(123)
+rfe_ctrl <- rfeControl(functions = rfFuncs,
+                       method = "repeatedcv",
+                       number = 10,
+                       repeats = 5,
+                       verbose = FALSE,
+                       returnResamp = "all")
+
+# sizes: try 1..all predictors (adjust to speed it up)
+max_features <- ncol(covariate_data)
+sizes <- seq(1, max_features, by = 1)
+
+# prepare output containers
+results_list_SP <- list()
+summary_list_SP <- list()
+
+# Start cluster for parallel processing
+ncores <- max(1, parallel::detectCores() - 1)
+cl <- makePSOCKcluster(ncores)
+registerDoParallel(cl)
+
+# Loop over each soil target in soil_vars using SP dataset (change to soil_data_C if desired)
+for (tgt in soil_vars) {
+  message("=== Processing: ", tgt, " ===")
+  # prepare training df
+  response <- soil_data_SP[[tgt]]
+  training_df <- data.frame(response = response, covariate_data)
+  # remove incomplete rows (NA)
+  training_df <- training_df[complete.cases(training_df), ]
+  if (nrow(training_df) < 10) {
+    warning("Too few complete rows for target ", tgt, "; skipping.")
+    next
+  }
+
+  # Run RFE (caret)
+  set.seed(123)
+  rfe_fit <- rfe(x = training_df[, -1],
+                 y = training_df$response,
+                 sizes = sizes,
+                 rfeControl = rfe_ctrl,
+                 metric = "RMSE",
+                 ntree = 500)
+
+  opt_vars <- predictors(rfe_fit)        # selected optimal variables (character vector)
+  message("Selected variables (", length(opt_vars), "): ", paste(opt_vars, collapse = ", "))
+
+  # Train final randomForest on selected predictors
+  if (length(opt_vars) == 0) {
+    warning("No variables selected for ", tgt, "; skipping model build")
+    next
+  }
+  final_train <- training_df[, c("response", opt_vars)]
+  set.seed(123)
+  final_rf <- randomForest(response ~ ., data = final_train, ntree = 1000, importance = TRUE)
+
+  # Get standard importance table (vi) and permutation importance (vi_permute)
+  # vi (fast)
+  vi_tab <- vi(final_rf)   # tibble with Variable and Importance
+  # permutation importance (slower but more robust)
+  set.seed(123)
+  # vi_permute expects full training "data" including predictors and target; pass predictor/data properly
+  perm <- tryCatch({
+    vi_permute(
+      object = final_rf,
+      feature_names = opt_vars,
+      train = final_train[, opt_vars, drop = FALSE],
+      target = final_train$response,
+      metric = "rmse",
+      nsim = 20,      # increase for stability; reduce for speed
+      progress = FALSE
+    )
+  }, error = function(e) {
+    warning("vi_permute failed for ", tgt, ": ", conditionMessage(e))
+    NULL
+  })
+
+  # Create a combined importance tibble: prefer permutation if available
+  if (!is.null(perm)) {
+    # perm has columns: Variable, Importance, Lower, Upper, or similar
+    vi_to_plot <- perm %>% arrange(desc(Importance))
+    importance_source <- "permutation"
+  } else {
+    vi_to_plot <- vi_tab %>% arrange(desc(Importance))
+    importance_source <- "vi"
+  }
+
+
+# this is the simplest — vip knows how to extract importance from randomForest objects
+p_model <- vip(final_rf, num_features = 20, geom = "col") + coord_flip()
+print(p_model)
+ggsave(sprintf("../outputs/VIP/vip_model_%s_top20_SP.png", tgt), p_model, width = 8, height = 6, dpi = 300)
+
+  # Save rfe object and rf model in results list
+  results_list_SP[[tgt]] <- list(rfe = rfe_fit,
+                              rf = final_rf,
+                              vi = vi_tab,
+                              vi_permutation = perm,
+                              opt_vars = opt_vars)
+
+  # Save summary
+  summary_list_SP[[tgt]] <- tibble(
+    target = tgt,
+    n_train = nrow(training_df),
+    n_selected = length(opt_vars),
+    selected = paste(opt_vars, collapse = ";")
+  )
+}
+
+# stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+# combine summaries and write CSV
+summary_df_SP <- bind_rows(summary_list_SP)
+write.csv(summary_df_SP, "../outputs/VIP/rfe_selected_variables_summary_SP.csv", row.names = FALSE)
+message("../outputs/VIP/Wrote summary CSV: rfe_selected_variables_summary_SP.csv")
+
+# optionally save R objects to disk (RDS)
+saveRDS(results_list_SP, file = "rfe_rf_results_list.rds")
+message("../outputs/VIP/Saved results_list to rfe_rf_results_list_SP.rds")
+
+# Quick display of selected vars
+print(summary_df_SP)
+```
+```{r}
+#Composite RFE + RF + VIP analysis
+
+# --- RFE settings ---
+set.seed(123)
+rfe_ctrl <- rfeControl(functions = rfFuncs,
+                       method = "repeatedcv",
+                       number = 10,
+                       repeats = 5,
+                       verbose = FALSE,
+                       returnResamp = "all")
+
+# sizes: try 1..all predictors (adjust to speed it up)
+max_features <- ncol(covariate_data)
+sizes <- seq(1, max_features, by = 1)
+
+# prepare output containers
+results_list_C <- list()
+summary_list_C <- list()
+
+# Start cluster for parallel processing
+ncores <- max(1, parallel::detectCores() - 1)
+cl <- makePSOCKcluster(ncores)
+registerDoParallel(cl)
+
+# Loop over each soil target in soil_vars using SP dataset (change to soil_data_C if desired)
+for (tgt in soil_vars) {
+  message("=== Processing: ", tgt, " ===")
+  # prepare training df
+  response <- soil_data_C[[tgt]]
+  training_df <- data.frame(response = response, covariate_data)
+  # remove incomplete rows (NA)
+  training_df <- training_df[complete.cases(training_df), ]
+  if (nrow(training_df) < 10) {
+    warning("Too few complete rows for target ", tgt, "; skipping.")
+    next
+  }
+
+  # Run RFE (caret)
+  set.seed(123)
+  rfe_fit <- rfe(x = training_df[, -1],
+                 y = training_df$response,
+                 sizes = sizes,
+                 rfeControl = rfe_ctrl,
+                 metric = "RMSE",
+                 ntree = 500)
+
+  opt_vars <- predictors(rfe_fit)        # selected optimal variables (character vector)
+  message("Selected variables (", length(opt_vars), "): ", paste(opt_vars, collapse = ", "))
+
+  # Train final randomForest on selected predictors
+  if (length(opt_vars) == 0) {
+    warning("No variables selected for ", tgt, "; skipping model build")
+    next
+  }
+  final_train <- training_df[, c("response", opt_vars)]
+  set.seed(123)
+  final_rf <- randomForest(response ~ ., data = final_train, ntree = 1000, importance = TRUE)
+
+  # Get standard importance table (vi) and permutation importance (vi_permute)
+  # vi (fast)
+  vi_tab <- vi(final_rf)   # tibble with Variable and Importance
+  # permutation importance (slower but more robust)
+  set.seed(123)
+  # vi_permute expects full training "data" including predictors and target; pass predictor/data properly
+  perm <- tryCatch({
+    vi_permute(
+      object = final_rf,
+      feature_names = opt_vars,
+      train = final_train[, opt_vars, drop = FALSE],
+      target = final_train$response,
+      metric = "rmse",
+      nsim = 20,      # increase for stability; reduce for speed
+      progress = FALSE
+    )
+  }, error = function(e) {
+    warning("vi_permute failed for ", tgt, ": ", conditionMessage(e))
+    NULL
+  })
+
+  # Create a combined importance tibble: prefer permutation if available
+  if (!is.null(perm)) {
+    # perm has columns: Variable, Importance, Lower, Upper, or similar
+    vi_to_plot <- perm %>% arrange(desc(Importance))
+    importance_source <- "permutation"
+  } else {
+    vi_to_plot <- vi_tab %>% arrange(desc(Importance))
+    importance_source <- "vi"
+  }
+
+
+# this is the simplest — vip knows how to extract importance from randomForest objects
+p_model <- vip(final_rf, num_features = 20, geom = "col") + coord_flip()
+print(p_model)
+ggsave(sprintf("../outputs/VIP/vip_model_%s_top20_C.png", tgt), p_model, width = 8, height = 6, dpi = 300)
+
+  # Save rfe object and rf model in results list
+  results_list_C[[tgt]] <- list(rfe = rfe_fit,
+                              rf = final_rf,
+                              vi = vi_tab,
+                              vi_permutation = perm,
+                              opt_vars = opt_vars)
+
+  # Save summary
+  summary_list_C[[tgt]] <- tibble(
+    target = tgt,
+    n_train = nrow(training_df),
+    n_selected = length(opt_vars),
+    selected = paste(opt_vars, collapse = ";")
+  )
+}
+
+# stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+# combine summaries and write CSV
+summary_df_C <- bind_rows(summary_list)
+write.csv(summary_df_C, "../outputs/VIP/rfe_selected_variables_summary_C.csv", row.names = FALSE)
+message("../outputs/VIP/Wrote summary CSV: rfe_selected_variables_summary_C.csv")
+
+# optionally save R objects to disk (RDS)
+saveRDS(results_list_C, file = "rfe_rf_results_list_C.rds")
+message("../outputs/VIP/Saved results_list to rfe_rf_results_list_C.rds")
+
+# Quick display of selected vars
+print(summary_df_C)
+```
+
+
+```{r}
+#RF for Composite data with bootstrapping based on RFE selected variables
+# --- User settings ---
+n_boot <- 100      # number of bootstrap iterations (reduce for testing)
+ntree_rf <- 500          # trees in each RF
+set_seeds <- sample.int(1e6, n_boot)  # unique seeds for reproducibility
+
+# Ensure you have these objects in your workspace:
+# soil_covariate_data_scaled_C  (data.frame)
+# soil_vars                     (character vector of soil targets)
+# results_list_C                (list with element per nutrient containing $opt_vars)
+#
+# If results_list_C isn't in memory, try to load the RDS you saved earlier:
+if (!exists("results_list_C")) {
+  if (file.exists("rfe_rf_results_list_C.rds")) {
+    results_list_C <- readRDS("rfe_rf_results_list_C.rds")
+    message("Loaded results_list_C from rfe_rf_results_list_C.rds")
+  } else {
+    stop("results_list_C not found in workspace and rfe_rf_results_list_C.rds not present. Provide results_list_C (RFE outputs).")
+  }
+}
+if (!exists("soil_covariate_data_scaled_C")) stop("soil_covariate_data_scaled_C not found in workspace.")
+if (!exists("soil_vars")) stop("soil_vars not found in workspace.")
+
+# Containers for final outputs
+bootstrap_results_C <- list()
+summary_rows_C <- list()
+
+for (nutrient in soil_vars) {
+  message("=== Bootstrapping: ", nutrient, " ===")
+  # get selected predictors from RFE results
+  if (! (nutrient %in% names(results_list_C)) ) {
+    warning("No RFE result entry for ", nutrient, " — skipping.")
+    next
+  }
+  opt_vars <- results_list_C[[nutrient]]$opt_vars
+  if (is.null(opt_vars) || length(opt_vars) == 0) {
+    warning("No selected variables for ", nutrient, " — skipping.")
+    next
+  }
+
+  # build df with only nutrient and selected predictors
+  df <- soil_covariate_data_scaled_C[, c(nutrient, opt_vars), drop = FALSE]
+  df <- na.omit(df)
+  n_rows <- nrow(df)
+  if (n_rows < 10) {
+    warning("Too few complete rows (", n_rows, ") for ", nutrient, " — skipping.")
+    next
+  }
+
+  # Pre-allocate
+  boot_rmse <- numeric(n_boot)
+  boot_r2   <- numeric(n_boot)
+  rf_models  <- vector("list", n_boot)
+
+  for (i in seq_len(n_boot)) {
+    set.seed(set_seeds[i])
+
+    # create train/test split (80/20)
+    trainIndex <- createDataPartition(df[[nutrient]], p = 0.8, list = FALSE)
+    train <- df[trainIndex, , drop = FALSE]
+    test  <- df[-trainIndex, , drop = FALSE]
+
+    # If test has fewer than 2 rows, skip this iteration (cannot compute correlation/R2)
+    if (nrow(test) < 2) {
+      boot_rmse[i] <- NA
+      boot_r2[i]   <- NA
+      rf_models[[i]] <- NULL
+      next
+    }
+
+    # Fit RF using only the selected predictors
+    rf_model <- randomForest(
+      x = train[, opt_vars, drop = FALSE],
+      y = train[[nutrient]],
+      ntree = ntree_rf,
+      importance = FALSE
+    )
+    rf_models[[i]] <- rf_model
+
+    # Predict and compute metrics
+    pred <- predict(rf_model, newdata = test[, opt_vars, drop = FALSE])
+    obs  <- test[[nutrient]]
+
+    # RMSE
+    boot_rmse[i] <- sqrt(mean((pred - obs)^2, na.rm = TRUE))
+
+    # R2 (squared Pearson correlation), guard against zero variance or NA
+    if (length(pred) >= 2 && sd(pred, na.rm = TRUE) > 0 && sd(obs, na.rm = TRUE) > 0) {
+      boot_r2[i] <- suppressWarnings(cor(pred, obs, use = "complete.obs")^2)
+    } else {
+      boot_r2[i] <- NA
+    }
+  } # end bootstrap loop
+
+  # Remove NA iterations from consideration
+  valid_idx <- which(!is.na(boot_r2))
+  if (length(valid_idx) == 0) {
+    warning("No valid bootstrap runs for ", nutrient, "; all R2 are NA. Skipping save.")
+    next
+  }
+
+  # choose best model index (max R2); if you prefer lowest RMSE, replace with which.min(boot_rmse[valid_idx])
+  best_model_idx <- valid_idx[which.max(boot_r2[valid_idx])]
+  best_rf_model <- rf_models[[best_model_idx]]
+
+  # Save results for nutrient
+  bootstrap_results_C[[nutrient]] <- list(
+    best_model_index = best_model_idx,
+    best_rmse = boot_rmse[best_model_idx],
+    best_r2   = boot_r2[best_model_idx],
+    best_rf_model = best_rf_model,
+    all_rmse = boot_rmse,
+    all_r2   = boot_r2,
+    opt_vars = opt_vars,
+    n_train = n_rows
+  )
+
+  # summary row
+  summary_rows_C[[nutrient]] <- tibble::tibble(
+    target = nutrient,
+    n_train = n_rows,
+    n_selected = length(opt_vars),
+    selected = paste(opt_vars, collapse = ";"),
+    best_iter = best_model_idx,
+    best_rmse = boot_rmse[best_model_idx],
+    best_r2 = boot_r2[best_model_idx],
+    mean_rmse = mean(boot_rmse, na.rm = TRUE),
+    mean_r2 = mean(boot_r2, na.rm = TRUE)
+  )
+
+  message(sprintf("%s: Best RMSE=%.3f, Best R2=%.3f (iter=%d)", nutrient, boot_rmse[best_model_idx], boot_r2[best_model_idx], best_model_idx))
+
+  # Optionally save the best model to disk for later prediction
+  saveRDS(best_rf_model, file = sprintf("../outputs/C/rf_bootstrap_100n/rf_best_%s_bootmodel.rds", nutrient))
+} # end nutrient loop
+
+# Combine and write summary CSV
+if (length(summary_rows_C) > 0) {
+  summary_df_rf_C <- bind_rows(summary_rows_C)
+  write.csv(summary_df_rf_C, "../outputs/C/rf_bootstrap_100n/rf_bootstrap_summary_C.csv", row.names = FALSE)
+  message("Wrote summary to rf_bootstrap_summary_C.csv")
+} else {
+  message("No summaries to write.")
+}
+
+# Save full results list (RDS)
+saveRDS(bootstrap_results, file = "../outputs/C/rf_bootstrap_100n/rf_bootstrap_results_C.rds")
+message("Saved bootstrap_results to rf_bootstrap_results_C.rds")
+```
+
+```{r}
+#RF for single point data with bootstrapping based on RFE selected variables
+# --- User settings ---
+n_boot <- 100      # number of bootstrap iterations (reduce for testing)
+ntree_rf <- 500          # trees in each RF
+set_seeds <- sample.int(1e6, n_boot)  # unique seeds for reproducibility
+
+# Ensure you have these objects in your workspace:
+# soil_covariate_data_scaled_C  (data.frame)
+# soil_vars                     (character vector of soil targets)
+# results_list_C                (list with element per nutrient containing $opt_vars)
+#
+# If results_list_C isn't in memory, try to load the RDS you saved earlier:
+if (!exists("results_list_SP")) {
+  if (file.exists("rfe_rf_results_list_SP.rds")) {
+    results_list_C <- readRDS("rfe_rf_results_list_C.rds")
+    message("Loaded results_list_C from rfe_rf_results_list_C.rds")
+  } else {
+    stop("results_list_C not found in workspace and rfe_rf_results_list_C.rds not present. Provide results_list_C (RFE outputs).")
+  }
+}
+if (!exists("soil_covariate_data_scaled_C")) stop("soil_covariate_data_scaled_C not found in workspace.")
+if (!exists("soil_vars")) stop("soil_vars not found in workspace.")
+
+# Containers for final outputs
+bootstrap_results_C <- list()
+summary_rows_C <- list()
+
+for (nutrient in soil_vars) {
+  message("=== Bootstrapping: ", nutrient, " ===")
+  # get selected predictors from RFE results
+  if (! (nutrient %in% names(results_list_C)) ) {
+    warning("No RFE result entry for ", nutrient, " — skipping.")
+    next
+  }
+  opt_vars <- results_list_C[[nutrient]]$opt_vars
+  if (is.null(opt_vars) || length(opt_vars) == 0) {
+    warning("No selected variables for ", nutrient, " — skipping.")
+    next
+  }
+
+  # build df with only nutrient and selected predictors
+  df <- soil_covariate_data_scaled_C[, c(nutrient, opt_vars), drop = FALSE]
+  df <- na.omit(df)
+  n_rows <- nrow(df)
+  if (n_rows < 10) {
+    warning("Too few complete rows (", n_rows, ") for ", nutrient, " — skipping.")
+    next
+  }
+
+  # Pre-allocate
+  boot_rmse <- numeric(n_boot)
+  boot_r2   <- numeric(n_boot)
+  rf_models  <- vector("list", n_boot)
+
+  for (i in seq_len(n_boot)) {
+    set.seed(set_seeds[i])
+
+    # create train/test split (80/20)
+    trainIndex <- createDataPartition(df[[nutrient]], p = 0.8, list = FALSE)
+    train <- df[trainIndex, , drop = FALSE]
+    test  <- df[-trainIndex, , drop = FALSE]
+
+    # If test has fewer than 2 rows, skip this iteration (cannot compute correlation/R2)
+    if (nrow(test) < 2) {
+      boot_rmse[i] <- NA
+      boot_r2[i]   <- NA
+      rf_models[[i]] <- NULL
+      next
+    }
+
+    # Fit RF using only the selected predictors
+    rf_model <- randomForest(
+      x = train[, opt_vars, drop = FALSE],
+      y = train[[nutrient]],
+      ntree = ntree_rf,
+      importance = FALSE
+    )
+    rf_models[[i]] <- rf_model
+
+    # Predict and compute metrics
+    pred <- predict(rf_model, newdata = test[, opt_vars, drop = FALSE])
+    obs  <- test[[nutrient]]
+
+    # RMSE
+    boot_rmse[i] <- sqrt(mean((pred - obs)^2, na.rm = TRUE))
+
+    # R2 (squared Pearson correlation), guard against zero variance or NA
+    if (length(pred) >= 2 && sd(pred, na.rm = TRUE) > 0 && sd(obs, na.rm = TRUE) > 0) {
+      boot_r2[i] <- suppressWarnings(cor(pred, obs, use = "complete.obs")^2)
+    } else {
+      boot_r2[i] <- NA
+    }
+  } # end bootstrap loop
+
+  # Remove NA iterations from consideration
+  valid_idx <- which(!is.na(boot_r2))
+  if (length(valid_idx) == 0) {
+    warning("No valid bootstrap runs for ", nutrient, "; all R2 are NA. Skipping save.")
+    next
+  }
+
+  # choose best model index (max R2); if you prefer lowest RMSE, replace with which.min(boot_rmse[valid_idx])
+  best_model_idx <- valid_idx[which.max(boot_r2[valid_idx])]
+  best_rf_model <- rf_models[[best_model_idx]]
+
+  # Save results for nutrient
+  bootstrap_results_C[[nutrient]] <- list(
+    best_model_index = best_model_idx,
+    best_rmse = boot_rmse[best_model_idx],
+    best_r2   = boot_r2[best_model_idx],
+    best_rf_model = best_rf_model,
+    all_rmse = boot_rmse,
+    all_r2   = boot_r2,
+    opt_vars = opt_vars,
+    n_train = n_rows
+  )
+
+  # summary row
+  summary_rows_C[[nutrient]] <- tibble::tibble(
+    target = nutrient,
+    n_train = n_rows,
+    n_selected = length(opt_vars),
+    selected = paste(opt_vars, collapse = ";"),
+    best_iter = best_model_idx,
+    best_rmse = boot_rmse[best_model_idx],
+    best_r2 = boot_r2[best_model_idx],
+    mean_rmse = mean(boot_rmse, na.rm = TRUE),
+    mean_r2 = mean(boot_r2, na.rm = TRUE)
+  )
+
+  message(sprintf("%s: Best RMSE=%.3f, Best R2=%.3f (iter=%d)", nutrient, boot_rmse[best_model_idx], boot_r2[best_model_idx], best_model_idx))
+
+  # Optionally save the best model to disk for later prediction
+  saveRDS(best_rf_model, file = sprintf("../outputs/C/rf_bootstrap_100n/rf_best_%s_bootmodel.rds", nutrient))
+} # end nutrient loop
+
+# Combine and write summary CSV
+if (length(summary_rows_C) > 0) {
+  summary_df_rf_C <- bind_rows(summary_rows_C)
+  write.csv(summary_df_rf_C, "../outputs/C/rf_bootstrap_100n/rf_bootstrap_summary_C.csv", row.names = FALSE)
+  message("Wrote summary to rf_bootstrap_summary_C.csv")
+} else {
+  message("No summaries to write.")
+}
+
+# Save full results list (RDS)
+saveRDS(bootstrap_results, file = "../outputs/C/rf_bootstrap_100n/rf_bootstrap_results_C.rds")
+message("Saved bootstrap_results to rf_bootstrap_results_C.rds")
+```
+
+```{r}
+
+```
+
